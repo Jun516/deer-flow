@@ -132,4 +132,4 @@ jobs:
       - name: Fixed regression controls
         if: ${{ matrix.variant == 'fixed' && !cancelled() }}
         working-directory: backend
-        run: uv run --locked pytest tests/test_channel_thread_binding_store.py -q -k corrupt or valid_utf8_bindings --tb=short
+        run: uv run --locked pytest tests/test_channel_thread_binding_store.py -q -k 'corrupt or valid_utf8_bindings' --tb=short
