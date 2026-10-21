@@ -1,0 +1,135 @@
+name: Verify channel store UTF-8 corruption recovery
+
+on:
+  push:
+    branches: [verify-channel-store-utf8]
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUTF8: '1'
+  PYTHONIOENCODING: utf-8
+  PYTHONDONTWRITEBYTECODE: '1'
+  LANGSMITH_TRACING: 'false'
+  LANGCHAIN_TRACING_V2: 'false'
+
+jobs:
+  tests:
+    name: ${{ matrix.variant }} offline shard ${{ matrix.shard }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [baseline, fixed]
+        shard: [1, 2, 3, 4]
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: deerflow
+          POSTGRES_PASSWORD: deerflow
+          POSTGRES_DB: deerflow_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready --health-interval 10s
+          --health-timeout 5s --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 10s
+          --health-timeout 5s --health-retries 5
+    env:
+      TEST_POSTGRES_URI: postgresql://deerflow:deerflow@localhost:5432/deerflow_test?sslmode=disable
+      DEDUPE_TEST_POSTGRES_URL: postgresql://deerflow:deerflow@localhost:5432/deerflow_test?sslmode=disable
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ matrix.variant == 'baseline' && '8b68832f32a0bb724e1ca39983ae0c43284a0c40' || 'c4831631b38e151a3d84f04a98ae3d06538961b7' }}
+          persist-credentials: false
+          fetch-depth: 2
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: '0.11.1'
+          enable-cache: true
+      - name: Verify exact source
+        env:
+          EXPECTED_HEAD: ${{ matrix.variant == 'baseline' && '8b68832f32a0bb724e1ca39983ae0c43284a0c40' || 'c4831631b38e151a3d84f04a98ae3d06538961b7' }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+      - name: Install locked backend dependencies
+        working-directory: backend
+        run: uv sync --locked --group dev --extra postgres
+      - name: Full offline test shard
+        working-directory: backend
+        run: make test-shard SPLITS=4 GROUP=${{ matrix.shard }}
+      - name: Verify tracked source unchanged
+        if: ${{ !cancelled() }}
+        run: git diff --exit-code HEAD --
+
+  gates:
+    name: ${{ matrix.variant }} lint and strict blocking IO
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [baseline, fixed]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ matrix.variant == 'baseline' && '8b68832f32a0bb724e1ca39983ae0c43284a0c40' || 'c4831631b38e151a3d84f04a98ae3d06538961b7' }}
+          persist-credentials: false
+          fetch-depth: 2
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: '0.11.1'
+          enable-cache: true
+      - name: Install locked backend dependencies
+        working-directory: backend
+        run: uv sync --locked --group dev --extra postgres
+      - name: Verify source and whitespace
+        env:
+          EXPECTED_HEAD: ${{ matrix.variant == 'baseline' && '8b68832f32a0bb724e1ca39983ae0c43284a0c40' || 'c4831631b38e151a3d84f04a98ae3d06538961b7' }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+          git diff --check '8b68832f32a0bb724e1ca39983ae0c43284a0c40'...HEAD
+      - name: Backend lint and formatting
+        working-directory: backend
+        run: make lint
+      - name: Strict blocking IO tests
+        if: ${{ !cancelled() }}
+        working-directory: backend
+        run: make test-blocking-io
+      - name: Prove new regression fails on original implementation
+        if: ${{ matrix.variant == 'fixed' && !cancelled() }}
+        working-directory: backend
+        run: |
+          uv run python - <<'PY'
+          from pathlib import Path
+          import subprocess
+          path = Path('app/channels/store.py')
+          fixed = path.read_bytes()
+          original = subprocess.check_output(['git', 'show', '8b68832f32a0bb724e1ca39983ae0c43284a0c40:backend/app/channels/store.py'])
+          try:
+              path.write_bytes(original)
+              result = subprocess.run(['uv', 'run', '--locked', 'pytest', 'tests/test_channel_thread_binding_store.py', '-q', '-k', 'corrupt or valid_utf8_bindings', '--tb=short'], text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=120)
+              print(result.stdout)
+              assert result.returncode == 1
+              assert '3 failed, 5 passed' in result.stdout
+              assert "UnicodeDecodeError" in result.stdout
+          finally:
+              path.write_bytes(fixed)
+          PY
+          git diff --exit-code HEAD --
+      - name: Fixed regression controls
+        if: ${{ matrix.variant == 'fixed' && !cancelled() }}
+        working-directory: backend
+        run: uv run --locked pytest tests/test_channel_thread_binding_store.py -q -k corrupt or valid_utf8_bindings --tb=short
