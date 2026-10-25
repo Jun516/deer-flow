@@ -1,0 +1,52 @@
+name: Podcast path identity verification
+on:
+  push:
+    branches: [verification/podcast-paths-20261025-linux]
+permissions:
+  contents: read
+jobs:
+  linux-regressions:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      PYTHONUTF8: '1'
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+      - name: Install pinned standalone skill dependencies
+        run: python -m pip install -r tests/skills/requirements.txt
+      - name: Check exact product parent
+        run: |
+          test "$(git rev-parse HEAD^)" = 55ff7ccaabf640f9b6180161019f2f116bf1105c
+          test "$(git diff --name-only HEAD^ HEAD)" = .github/workflows/contribution-verification-20261025.yml
+      - name: Focused regression including symbolic links
+        run: python -m pytest tests/skills/test_podcast_output_paths.py -q -rs
+      - name: Full standalone public skill suite
+        run: python -m pytest tests/skills -q -rs
+      - name: Unfixed production negative control in separate tree
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          import shutil
+          import subprocess
+          import sys
+          root = Path(os.environ['RUNNER_TEMP']) / 'podcast-unfixed'
+          shutil.copytree('skills/public/podcast-generation', root / 'skills/public/podcast-generation')
+          (root / 'tests/skills').mkdir(parents=True)
+          for name in ('skill_loader.py', 'test_podcast_output_paths.py'):
+              shutil.copy2(Path('tests/skills') / name, root / 'tests/skills' / name)
+          baseline = subprocess.check_output(['git', 'show', '2ce9bdc0036a3cc6d234437bcad0f057c7a99adf:skills/public/podcast-generation/scripts/generate.py'])
+          (root / 'skills/public/podcast-generation/scripts/generate.py').write_bytes(baseline)
+          result = subprocess.run([sys.executable, '-m', 'pytest', 'tests/skills/test_podcast_output_paths.py', '-q', '-rs'], cwd=root, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+          print(result.stdout)
+          assert result.returncode == 1
+          assert '15 failed, 2 passed' in result.stdout
+          assert ' skipped' not in result.stdout
+          PY
