@@ -1,0 +1,176 @@
+name: Verify podcast path identity on Linux and native APFS
+
+on:
+  push:
+    branches: [verification/podcast-native-20261026]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUTF8: '1'
+  PYTHONDONTWRITEBYTECODE: '1'
+  LANGSMITH_TRACING: 'false'
+  LANGCHAIN_TRACING_V2: 'false'
+  PRODUCT_HEAD: cf43a01d8ace884c25a37befc531115731f9926e
+  REVIEW_PARENT: 55ff7ccaabf640f9b6180161019f2f116bf1105c
+
+jobs:
+  linux-skills:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 3
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Verify exact product parent
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD^)" = "$PRODUCT_HEAD"
+          test "$(git diff --name-only HEAD^ HEAD)" = .github/workflows/verify-channel-store-utf8.yml
+      - name: Install standalone skill dependencies
+        run: python -m pip install -r tests/skills/requirements.txt
+      - name: Full offline public skill suite
+        run: python -m pytest tests/skills -q -rs
+
+  native-apfs:
+    runs-on: macos-14
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 3
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Verify exact product and platform
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD^)" = "$PRODUCT_HEAD"
+          test "$(git diff --name-only HEAD^ HEAD)" = .github/workflows/verify-channel-store-utf8.yml
+          sw_vers
+          python --version
+          mkdir -p reports
+          /usr/bin/hdiutil create -help > reports/hdiutil-create-help.txt 2>&1 || true
+          /usr/bin/hdiutil attach -help > reports/hdiutil-attach-help.txt 2>&1 || true
+          /usr/bin/hdiutil detach -help > reports/hdiutil-detach-help.txt 2>&1 || true
+      - name: Install standalone skill dependencies
+        run: python -m pip install -r tests/skills/requirements.txt
+      - name: Test real case-insensitive and case-sensitive APFS volumes
+        shell: bash
+        run: |
+          set -euo pipefail
+          scratch="$(mktemp -d "$RUNNER_TEMP/podcast-apfs.XXXXXX")"
+          mounts=()
+          cleanup() {
+            result=$?
+            for mount in "${mounts[@]}"; do
+              /usr/bin/hdiutil detach "$mount" || true
+            done
+            exit "$result"
+          }
+          trap cleanup EXIT
+
+          # A sparse image has a 512 MiB logical capacity and uses only written blocks.
+          for kind in insensitive sensitive; do
+            fs=APFS
+            expected=0
+            if [ "$kind" = sensitive ]; then
+              fs='Case-sensitive APFS'
+              expected=1
+            fi
+            image="$scratch/$kind.sparseimage"
+            mount="$scratch/mount-$kind"
+            mkdir "$mount"
+            /usr/bin/hdiutil create -size 512m -type SPARSE -fs "$fs" -volname "Podcast-$kind" "$image"
+            /usr/bin/hdiutil attach -nobrowse -mountpoint "$mount" "$image"
+            mounts+=("$mount")
+            export APFS_MOUNT="$mount" EXPECTED_CASE_SENSITIVE="$expected" APFS_KIND="$kind"
+            python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import sys
+          assert sys.platform == 'darwin'
+          root = Path(os.environ['APFS_MOUNT'])
+          expected = int(os.environ['EXPECTED_CASE_SENSITIVE'])
+          observed = os.pathconf(root, 11)
+          assert observed == expected, (root, observed, expected)
+          first = root / 'CaseProbe.txt'
+          alternate = root / 'caseprobe.txt'
+          first.write_text('native-volume-probe', encoding='utf-8')
+          aliases = alternate.exists()
+          assert aliases == (expected == 0)
+          if aliases:
+              assert os.path.samefile(first, alternate)
+          result = {'platform': sys.platform, 'volume': os.environ['APFS_KIND'],
+                    'pathconf_selector': 11, 'case_sensitive': observed,
+                    'real_case_alias_exists': aliases}
+          print(json.dumps(result))
+          Path('reports', 'volume-' + os.environ['APFS_KIND'] + '.json').write_text(
+              json.dumps(result, indent=2), encoding='utf-8')
+          PY
+            mkdir "$mount/tmp"
+            export TMPDIR="$mount/tmp"
+            python -m pytest tests/skills/test_podcast_output_paths.py -q -rs \
+              --basetemp "$mount/pytest-fixed" --junitxml "reports/fixed-$kind.xml"
+
+            # Negative control uses the exact prior production script and new native tests.
+            # A separate small tree keeps the fixed checkout unchanged.
+            export BASELINE_TREE="$mount/baseline"
+            python - <<'PY'
+          import os
+          from pathlib import Path
+          import shutil
+          import subprocess
+          root = Path(os.environ['BASELINE_TREE'])
+          shutil.copytree('skills/public/podcast-generation', root / 'skills/public/podcast-generation')
+          (root / 'tests/skills').mkdir(parents=True)
+          for name in ('skill_loader.py', 'test_podcast_output_paths.py'):
+              shutil.copy2(Path('tests/skills', name), root / 'tests/skills' / name)
+          original = subprocess.check_output(['git', 'show', os.environ['REVIEW_PARENT'] + ':skills/public/podcast-generation/scripts/generate.py'])
+          (root / 'skills/public/podcast-generation/scripts/generate.py').write_bytes(original)
+          PY
+            export REPORT_ROOT="$GITHUB_WORKSPACE/reports"
+            python - <<'PY'
+          import os
+          from pathlib import Path
+          import subprocess
+          import sys
+          import xml.etree.ElementTree as ET
+          kind = os.environ['APFS_KIND']
+          report = Path(os.environ['REPORT_ROOT'])
+          root = Path(os.environ['BASELINE_TREE'])
+          xml = report / ('previous-production-' + kind + '.xml')
+          command = [sys.executable, '-m', 'pytest', '-q', '-rs',
+                     'tests/skills/test_podcast_output_paths.py',
+                     '-k', 'test_native_darwin_case_policy_controls_real_generation',
+                     '--basetemp', str(Path(os.environ['APFS_MOUNT']) / 'pytest-previous'),
+                     '--junitxml', str(xml)]
+          result = subprocess.run(command, cwd=root, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+          print(result.stdout)
+          (report / ('previous-production-' + kind + '.log')).write_text(result.stdout, encoding='utf-8')
+          cases = list(ET.parse(xml).iter('testcase'))
+          failures = sum(c.find('failure') is not None for c in cases)
+          errors = sum(c.find('error') is not None for c in cases)
+          skips = sum(c.find('skipped') is not None for c in cases)
+          assert len(cases) == 3 and errors == 0 and skips == 0, (len(cases), errors, skips)
+          if kind == 'insensitive':
+              assert result.returncode == 1 and failures == 3, (result.returncode, failures)
+          else:
+              assert result.returncode == 0 and failures == 0, (result.returncode, failures)
+          PY
+          done
+          git diff --exit-code HEAD --
+      - uses: actions/upload-artifact@v4
+        if: ${{ always() }}
+        with:
+          name: native-apfs-podcast-verification
+          path: reports/
+          retention-days: 7
